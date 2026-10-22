@@ -257,7 +257,7 @@ void EventListener::onEdgePiston(endstone::BlockPistonEvent& event) const
         static_cast<double>(event.getBlock().getLocation().getBlockZ())
     };
     if (const auto result = global_checker_->canPiston(piston_pos, piston_dim);
-        result.has_value() && !result.value())
+        result.has_value() && !*result)
     {
         event.setCancelled(true);
     }
@@ -378,9 +378,11 @@ void EventListener::onPlayerMove(endstone::PlayerMoveEvent& event)
     std::string player_name = player.getName();
     const string localeP = player.getLocale();
 
-    // 时间节流逻辑
+    const auto dimension = event.getTo().getDimension().getName();
+    const bool changed_dimension = !lastDimensions.contains(player_name) || lastDimensions[player_name] != dimension;
+    // Dimension transitions must reconcile even inside the movement throttle.
     auto now = std::chrono::steady_clock::now();
-    if (lastProcessTime.contains(player_name)) {
+    if (!changed_dimension && lastProcessTime.contains(player_name)) {
         if (auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastProcessTime[player_name]); duration < CHECK_INTERVAL) {
             return;
         }
@@ -397,8 +399,9 @@ void EventListener::onPlayerMove(endstone::PlayerMoveEvent& event)
 
     auto& [last_pos, last_tty, last_father] = territory_->lastPlayerPositions[player_name];
 
-    if (!territory_->config_welcome_all && last_pos == player_pos) return;
+    if (!changed_dimension && !territory_->config_welcome_all && last_pos == player_pos) return;
     last_pos = player_pos;
+    lastDimensions[player_name] = player_dim;
 
     // 利用空间索引寻找当前领地
     const auto res = territory_->action_->list_in_tty(player_pos, player_dim);
@@ -406,6 +409,13 @@ void EventListener::onPlayerMove(endstone::PlayerMoveEvent& event)
     const TerritoryData* selectedTerritory = nullptr;
     if (res.has_value() && !res->empty()) {
         selectedTerritory = (*res)[0].source;
+    }
+
+    const auto gm = player.getGameMode();
+    if (territory_->config_fly_on_tty && territory_->config_fly_exclusive_authority) {
+        const bool eligible = selectedTerritory && selectedTerritory->cached_operators.contains(player_name);
+        if (auto grant = flightGrants.reconcile(player_name, eligible, player.getAllowFlight(), gm == endstone::GameMode::Survival || gm == endstone::GameMode::Adventure))
+            player.setAllowFlight(*grant);
     }
 
     if (selectedTerritory != nullptr) {
@@ -431,17 +441,6 @@ void EventListener::onPlayerMove(endstone::PlayerMoveEvent& event)
 
             player.sendTip(action_str + selectedTerritory->owner + type_str + current_territory);
 
-            // 飞行校验
-            if (territory_->config_fly_on_tty) {
-                if (selectedTerritory->cached_operators.contains(player_name)) {
-                    player.setAllowFlight(true);
-                } else {
-                    if (int gm = static_cast<int>(player.getGameMode()); (gm == 0 || gm == 3) && player.getAllowFlight()) {
-                        player.setAllowFlight(false);
-                    }
-                }
-            }
-
             last_tty = current_territory;
             last_father = current_father_territory;
         }
@@ -456,15 +455,36 @@ void EventListener::onPlayerMove(endstone::PlayerMoveEvent& event)
 
             player.sendTip(lang_tty_.getLocal("§2[领地] §r您已离开领地 ", localeP) + last_tty + lang_tty_.getLocal(", 欢迎下次再来", localeP));
 
-            if (territory_->config_fly_on_tty) {
-                if (int gm = static_cast<int>(player.getGameMode()); (gm == 0 || gm == 3) && player.getAllowFlight()) {
-                    player.setAllowFlight(false);
-                }
-            }
             last_tty = "";
             last_father = "";
         }
     }
+}
+
+void EventListener::onPlayerQuit(endstone::PlayerQuitEvent& event) {
+    const auto name = event.getPlayer().getName();
+    if (flightGrants.remove(name)) {
+        const auto gm = event.getPlayer().getGameMode();
+        if (gm == endstone::GameMode::Survival || gm == endstone::GameMode::Adventure) event.getPlayer().setAllowFlight(false);
+    }
+    lastProcessTime.erase(name);
+    lastDimensions.erase(name);
+    territory_->lastPlayerPositions.erase(name);
+    territory_->quick_create_player_data.erase(name);
+}
+
+void EventListener::shutdown() {
+    for (const auto& name : flightGrants.grants()) {
+        if (auto* player = territory_->getServer().getPlayer(name)) {
+            const auto gm = player->getGameMode();
+            if (gm == endstone::GameMode::Survival || gm == endstone::GameMode::Adventure) player->setAllowFlight(false);
+        }
+    }
+    flightGrants.clear();
+    lastDimensions.clear();
+    lastProcessTime.clear();
+    territory_->lastPlayerPositions.clear();
+    territory_->quick_create_player_data.clear();
 }
 
 void EventListener::onEnititySummon(endstone::ActorSpawnEvent& event) const

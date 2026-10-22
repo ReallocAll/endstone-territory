@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 project(territory CXX)
-set(BASE_VERSION "0.4.2")
+set(BASE_VERSION "0.4.3")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -138,3 +138,12 @@ configure_file(
 
 # 将生成目录加入包含路径
 target_include_directories(${PROJECT_NAME} PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/generated" "${binarystream_SOURCE_DIR}/include")
+include(CTest)
+if(BUILD_TESTING)
+    # Compile the same production paths on both supported toolchains. No BDS
+    # server or platform mocks are needed for store/index/policy contracts.
+    add_executable(territory_contract_tests tests/contracts.cpp ${PLUGIN_SOURCES})
+    target_include_directories(territory_contract_tests PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/generated" "${binarystream_SOURCE_DIR}/include")
+    target_link_libraries(territory_contract_tests PRIVATE bstream_obj nlohmann_json::nlohmann_json SQLite::SQLite3 fmt::fmt-header-only endstone_money_connect)
+    add_test(NAME territory_contracts COMMAND territory_contract_tests)
+endif()

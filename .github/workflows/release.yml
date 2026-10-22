@@ -1,0 +1,204 @@
+name: Verify and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Validate release intent
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.intent.outputs.publish }}
+      version: ${{ steps.intent.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: intent
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/set(BASE_VERSION "\([^"]*\)")/\1/p' CMakeLists.txt)
+          SUBJECT=$(git log -1 --format=%s)
+          PUBLISH=false
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            test "$GITHUB_REF_NAME" = "v$VERSION"
+            PUBLISH=true
+          elif [[ "$SUBJECT" =~ ^chore:\ release\ v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            test "${BASH_REMATCH[1]}" = "$VERSION"
+            PUBLISH=true
+          fi
+          if [[ "$PUBLISH" == true ]]; then
+            grep -F "## [$VERSION]" CHANGELOG.md
+          fi
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # ===== Linux =====
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg lsb-release software-properties-common unzip zip
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          sudo apt-get install -y libc++-19-dev libc++abi-19-dev cmake libsqlite3-dev ninja-build
+
+      - name: Configure CMake (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DRELEASE_VERSION=1 \
+                -DCMAKE_C_COMPILER=clang-19 \
+                -DCMAKE_CXX_COMPILER=clang++-19 \
+                -DCMAKE_CXX_FLAGS="-stdlib=libc++"
+
+      # ===== Windows =====
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+
+      - name: Set up CMake and Ninja
+        if: runner.os == 'Windows'
+        uses: lukka/get-cmake@latest
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat
+          .\vcpkg\vcpkg.exe install sqlite3:x64-windows-static
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DRELEASE_VERSION=1 `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\vcpkg\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static
+
+      # ===== Build =====
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run contract tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # ===== Package =====
+      - name: Package plugin (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p package/territory/language
+          SO_FILE=build/endstone_territory.so
+          if [ ! -f "$SO_FILE" ]; then
+            echo "No .so file found!"
+            exit 1
+          fi
+          cp "$SO_FILE" package/endstone_territory.so
+          cp -r language/* package/territory/language/
+          cd package
+          zip -r ../territory_nightly_linux.zip endstone_territory.so territory
+
+      - name: Package plugin (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path package/territory/language -Force
+          Copy-Item build/endstone_territory.dll package/
+          Copy-Item language/* package/territory/language/ -Recurse
+          cd package
+          Compress-Archive -Path endstone_territory.dll, territory -DestinationPath ../territory_nightly_windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-plugin-${{ runner.os }}
+          path: territory_nightly_*.zip
+          retention-days: 14
+
+  release:
+    name: Publish validated version
+    needs: [prepare, build]
+    # EndKeep-style explicit version commit/tag; never overwrite a release.
+    if: github.repository == 'ReallocAll/endstone-territory' && needs.prepare.outputs.publish == 'true'
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: nightly-plugin-*
+          merge-multiple: true
+          path: artifacts
+      - name: Package verified artifacts and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VERSION"
+          mkdir release-assets
+          unzip -j artifacts/territory_nightly_linux.zip endstone_territory.so -d release-assets
+          unzip -j artifacts/territory_nightly_windows.zip endstone_territory.dll -d release-assets
+          cp artifacts/territory_nightly_linux.zip "release-assets/endstone-territory-v$VERSION-linux.zip"
+          cp artifacts/territory_nightly_windows.zip "release-assets/endstone-territory-v$VERSION-windows.zip"
+          python3 - <<'PYCODE'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path('release-assets')
+          files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.iterdir())}
+          (root / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in files.items()))
+          (root / 'build-provenance.json').write_text(json.dumps({
+              'commit': os.environ['GITHUB_SHA'], 'version': os.environ['VERSION'],
+              'run': os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'],
+              'checks': 'Linux and Windows build plus territory_contracts passed', 'sha256': files
+          }, indent=2) + '\n')
+          PYCODE
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Refusing to replace existing release $TAG" >&2
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            TAG_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq '.sha')
+            test "$TAG_SHA" = "$GITHUB_SHA" || { echo "Tag targets another commit" >&2; exit 1; }
+          fi
+          cat > release-notes.md <<EOFNOTES
+          Territory $TAG
+
+          Built and contract-tested on Linux and Windows from $GITHUB_SHA.
+          CI: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          修复精确身份/SQL查询、事务与缓存一致性、经济失败处理、坐标范围、活塞边界及飞行会话所有权。
+          兼容性变化：面积包含两端；负小数向下取整；飞行新增 fly_exclusive_authority 明确独占开关；活塞边界采用保守13格检查。
+          请先备份数据库并阅读 docs/SAFETY_CONTRACTS.md。经济审计需要人工处理未决操作；本版本不保证跨经济系统崩溃原子性。
+          首次安装或升级语言资源请使用平台zip；直接.so文件放入plugins。未进行实际BDS服务器验证。
+          EOFNOTES
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "Territory $TAG" --notes-file release-notes.md release-assets/*

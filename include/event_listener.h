@@ -5,6 +5,7 @@
 #ifndef TERRITORY_EVENT_LISTENER_H
 #define TERRITORY_EVENT_LISTENER_H
 #include <endstone/endstone.hpp>
+#include "flight_ownership.h"
 #include "translate.hpp"
 #include <territory_instance.h>
 
@@ -47,12 +48,17 @@ public:
     //玩家移动事件
     void onPlayerMove(endstone::PlayerMoveEvent& event);
 
+    void onPlayerQuit(endstone::PlayerQuitEvent& event);
+    void shutdown();
+
     //实体生成事件
     void onEnititySummon(endstone::ActorSpawnEvent& event) const;
 private:
     endstone::Plugin &plugin_;
     translate& lang_tty_;
     Territory* territory_;
+    std::unordered_map<std::string, std::string> lastDimensions;
+    FlightOwnership flightGrants;
     // 记录每个玩家上次触发领地逻辑的时间
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> lastProcessTime;
     // 检查间隔：1秒

@@ -40,6 +40,7 @@ public:
     string language = "en_US";
     vector<int64_t> config_entity_can_die;
     bool config_fly_on_tty;
+    bool config_fly_exclusive_authority = false;
     bool config_allow_op_as_member;
 
     //禁止进入领地的实体
@@ -70,6 +71,8 @@ public:
 
     //更改玩家资金
     [[nodiscard]] bool change_player_money(const std::string& player_name, double money) const;
+
+    bool apply_money_operation(const std::string& id, const std::string& player_name, double money) const;
 
     //实体位置监听
     void entity_move_listener() const;

@@ -228,20 +228,9 @@ std::optional<bool> TerritoryInstance::canPlayerDamage(const std::string& damage
 
 std::optional<bool> TerritoryInstance::canPiston(const Point3D& pos, const std::string& dim) const
 {
+    if (!action_->canPistonAffect(pos, dim)) return false;
     const auto ttyList = action_->list_in_tty(pos, dim);
-    if (!ttyList.has_value()) {
-        return std::nullopt;
-    }
-    // 活塞边缘权限：需要检查点是否在领地的边缘
-    for (const auto& info : ttyList.value()) {
-        if (!info.if_edge_piston) {
-            // 如果权限关闭，检查点是否在边缘
-            if (Territory_Action::check_in_tty_edge(info.name, pos)) {
-                return false;
-            }
-        }
-    }
-    return true;
+    return ttyList.has_value() ? std::optional<bool>{true} : std::nullopt;
 }
 
 std::optional<bool> TerritoryInstance::canWitherExist(const Point3D& pos, const std::string& dim) const

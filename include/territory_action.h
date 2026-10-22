@@ -6,6 +6,7 @@
 #define TERRITORY_TERRITORY_ACTION_H
 
 #include <vector>
+#include "claim_geometry.h"
 #include <optional>
 #include "database.hpp"
 #include "territory_instance.h"
@@ -47,15 +48,15 @@ public:
     static bool isTerritoryOverlapping(const std::tuple<double, double, double>& new_pos1,const std::tuple<double, double, double>& new_pos2,const std::string& new_dim, bool resize = false, const std::string& tty_name = "");
     static bool check_in_tty_edge(const string& tty_name, const Point3D& point);
     static int check_tty_num(const std::string& player_name);
-    static int get_tty_area(int x1, int z1, int x2, int z2);
+    static std::int64_t get_tty_area(double x1, double z1, double x2, double z2);
     static std::tuple<double, double, double> pos_to_tuple(const std::string& str);
     static bool isSubsetCube(const Cube &cube1, const Cube &cube2);
     [[nodiscard]] std::pair<bool, std::string> listTrueFatherTTY(const std::string& playerName,const Cube& childCube,const std::string& childDim) const;
     static std::vector<TerritoryData> list_player_tty(const std::string& player_name);
     [[nodiscard]] std::vector<std::string> getSubTty(const std::string& tty_name) const;
-    [[nodiscard]] bool del_Tty_by_name(const std::string& territory_name);
+    [[nodiscard]] bool del_Tty_by_name(const std::string& territory_name, const std::string& owner = "", double refund = 0, std::string* operation = nullptr);
     [[nodiscard]] bool del_player_tty(const std::string &tty_name);
-    [[nodiscard]] bool rename_Tty(const std::string& territory_name,const std::string& new_tty_name) const;
+    [[nodiscard]] bool rename_Tty(const std::string& territory_name,const std::string& new_tty_name);
     [[nodiscard]] std::pair<bool, std::string> rename_player_tty(const std::string &oldname, const std::string &newname);
     static std::optional<bool> is_tty_owner(const std::string &ttyname, const std::string &player_name);
     static std::optional<bool> is_tty_op(const std::string &ttyname, const std::string &player_name);
@@ -76,12 +77,19 @@ public:
     static std::vector<TerritoryData> getOpTtyList(const std::string& player_name);
     static std::vector<TerritoryData>getPlayerTtyList(const std::string& player_name);
     [[nodiscard]] std::pair<bool,std::string> resize_territory(const Point3D& pos1, const Point3D& pos2, const TerritoryData& old_tty_data, const Point3D& tppos, const std::string& locale = "");
+    bool canPistonAffect(const Point3D& base, const std::string& dimension) const;
     static void clearCache();
     std::shared_ptr<TerritoryInstance> getInstance(const std::string& name);
     static std::map<std::string, TerritoryData>& getAllTtyMutable();
 
 
 private:
+    bool insertClaim(const std::string& name, const std::string& owner, const Point3D& pos1, const Point3D& pos2, const Point3D& tppos, const std::string& dimension, const std::string& parent);
+    using ClaimMap = std::map<std::string, TerritoryData>;
+    using Grid = std::unordered_map<GridKey, std::vector<TerritoryData*>, GridKeyHash>;
+    struct Snapshot { ClaimMap claims; Grid grid; };
+    static Snapshot prepareSnapshot(ClaimMap claims);
+    void publishSnapshot(Snapshot& snapshot) noexcept;
     Territory* territory_;
     DataBase& database_;
     inline static std::map<std::string, TerritoryData> all_tty;

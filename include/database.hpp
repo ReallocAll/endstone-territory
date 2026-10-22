@@ -6,6 +6,10 @@
 #define TERRITORY_DATABASE_H
 
 #include <iostream>
+#include <algorithm>
+#include <ranges>
+#include <functional>
+#include <array>
 #include <sqlite3.h>
 #include <fstream>
 #include <string>
@@ -29,6 +33,134 @@ public:
     }
 
 
+    DataBase(const DataBase&) = delete;
+    DataBase& operator=(const DataBase&) = delete;
+
+    // The store owns the transaction. Failed statements and failed COMMIT both
+    // roll back; callers must publish cache/index changes only after success.
+    bool transaction(const std::function<bool()>& mutation) const {
+        if (executeSQL("BEGIN IMMEDIATE") != SQLITE_OK) return false;
+        try {
+            if (mutation() && executeSQL("COMMIT") == SQLITE_OK) return true;
+        } catch (...) {
+            (void)executeSQL("ROLLBACK");
+            throw;
+        }
+        (void)executeSQL("ROLLBACK");
+        return false;
+    }
+
+    int readTerritories(std::vector<std::map<std::string, std::string>>& result,
+                        const std::string& name = "") const {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = name.empty() ? "SELECT * FROM territories"
+                                      : "SELECT * FROM territories WHERE name = ?";
+        int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) return rc;
+        if (!name.empty()) sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+        std::vector<std::map<std::string, std::string>> rows;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            std::map<std::string, std::string> row;
+            for (int i = 0; i < sqlite3_column_count(stmt); ++i) {
+                auto value = reinterpret_cast<const char*>(sqlite3_column_text(stmt, i));
+                row[sqlite3_column_name(stmt, i)] = value ? value : "";
+            }
+            rows.push_back(std::move(row));
+        }
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) return rc;
+        result.swap(rows);
+        return SQLITE_OK;
+    }
+
+    bool renameTerritory(const std::string& name, const std::string& replacement) const {
+        if (replacement.empty()) return false;
+        return transaction([&] {
+            return updateValue("territories", "name", replacement, "name", name)
+                && updateChildren(name, replacement);
+        });
+    }
+
+    bool deleteTerritory(const std::string& name, const std::string& owner = "",
+                         double refund = 0, std::string* operation = nullptr) const {
+        return transaction([&] {
+            if (!updateChildren(name, "") || deleteTty(name) != SQLITE_OK) return false;
+            if (operation) {
+                *operation = queueMoney(owner, refund, "delete:" + name);
+                if (operation->empty()) return false;
+            }
+            return true;
+        });
+    }
+
+    // Durable audit, not an automatic retry queue. 'attempting' after a crash
+    // is ambiguous because MoneyConnect has no idempotency/transaction API.
+    std::string queueMoney(const std::string& owner, double amount, const std::string& reason) const {
+        sqlite3_stmt* check = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM territory_economy_operations WHERE owner=? AND state IN ('pending','attempting') LIMIT 1",
+                              -1, &check, nullptr) != SQLITE_OK) return "";
+        sqlite3_bind_text(check, 1, owner.c_str(), -1, SQLITE_TRANSIENT);
+        const int pending = sqlite3_step(check);
+        sqlite3_finalize(check);
+        if (pending != SQLITE_DONE) return ""; // Reconcile uncertain operations before spending again.
+        const auto id = generate_uuid_v4();
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "INSERT INTO territory_economy_operations (id,owner,amount,reason,state) VALUES (?,?,?,?,'pending')",
+                              -1, &stmt, nullptr) != SQLITE_OK) return "";
+        sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, owner.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 3, amount);
+        sqlite3_bind_text(stmt, 4, reason.c_str(), -1, SQLITE_TRANSIENT);
+        const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+        return ok ? id : "";
+    }
+
+    bool applyMoney(const std::string& id, const std::function<bool()>& operation) const {
+        if (!moneyState(id, "pending", "attempting")) return false;
+        // Exceptions deliberately leave 'attempting': the provider may have
+        // applied the payment before throwing. Never automatically replay it.
+        const bool success = operation();
+        if (!moneyState(id, "attempting", success ? "succeeded" : "failed"))
+            std::cerr << "Economy audit completion failed for " << id << "; do not replay" << std::endl;
+        return success;
+    }
+
+    bool moneyState(const std::string& id, const std::string& from, const std::string& to) const {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "UPDATE territory_economy_operations SET state=? WHERE id=? AND state=?",
+                              -1, &stmt, nullptr) != SQLITE_OK) return false;
+        sqlite3_bind_text(stmt, 1, to.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, from.c_str(), -1, SQLITE_TRANSIENT);
+        const bool ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+        sqlite3_finalize(stmt);
+        return ok;
+    }
+
+    bool resizeTerritory(const std::string& name, const std::array<double, 9>& coordinates) const {
+        return transaction([&] {
+            constexpr std::array columns{"pos1_x", "pos1_y", "pos1_z", "pos2_x", "pos2_y", "pos2_z",
+                                         "tppos_x", "tppos_y", "tppos_z"};
+            for (std::size_t i = 0; i < columns.size(); ++i) {
+                if (!updateValue("territories", columns[i], std::to_string(coordinates[i]), "name", name))
+                    return false;
+            }
+            return true;
+        });
+    }
+
+    bool updateChildren(const std::string& parent, const std::string& replacement) const {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "UPDATE territories SET father_tty = ? WHERE father_tty = ?",
+                               -1, &stmt, nullptr) != SQLITE_OK) return false;
+        sqlite3_bind_text(stmt, 1, replacement.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, parent.c_str(), -1, SQLITE_TRANSIENT);
+        const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+        return ok; // Zero children is valid.
+    }
+
     // 函数用于检查文件是否存在
     static bool fileExists(const std::string& filename) {
         const std::ifstream f(filename.c_str());
@@ -42,6 +174,8 @@ public:
 
     // 初始化数据库
 [[nodiscard]] int init_database() const {
+    if (executeSQL("CREATE TABLE IF NOT EXISTS territory_economy_operations (id TEXT PRIMARY KEY, owner TEXT NOT NULL, amount REAL NOT NULL, reason TEXT NOT NULL, state TEXT NOT NULL)") != SQLITE_OK)
+        return SQLITE_ERROR;
     // 权限字段列表
     std::vector<Column> auth_columns = {
         {"if_jiaohu", "INTEGER DEFAULT 0"},
@@ -261,10 +395,9 @@ public:
             return false;
         }
 
-        // 清理资源
+        const bool changed = sqlite3_changes(db_) == 1;
         sqlite3_finalize(stmt);
-
-        return true;
+        return changed;
     }
 
 
@@ -373,8 +506,9 @@ public:
         }
 
         // 清理资源
+        const bool changed = sqlite3_changes(db_) == 1;
         sqlite3_finalize(stmt);
-        return SQLITE_OK;
+        return changed ? SQLITE_OK : SQLITE_NOTFOUND;
     }
 
     int getTtyByFather(

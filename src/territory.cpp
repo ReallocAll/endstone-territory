@@ -94,6 +94,7 @@ void Territory::datafile_check() {
         {"welcome_all",true},
         {"language","zh_CN"},
         {"allow_fly_on_territory", false},
+        {"fly_exclusive_authority", false},
         {"allow_op_as_member", false}
     };
 
@@ -171,16 +172,34 @@ double Territory::get_player_money(const std::string& player_name) const
 
 //更改玩家资金
 bool Territory::change_player_money(const std::string& player_name, const double money) const {
-    if (!economy_service_) {
-        getLogger().error("MoneyConnect economy service not available");
+    if (!std::isfinite(money)) return false;
+    if (money == 0) return true;
+    const auto id = database_->queueMoney(player_name, money, "claim-payment-or-compensation");
+    if (id.empty()) {
+        getLogger().error("Could not persist economy intent for {}: {}", player_name, money);
         return false;
     }
-    if (money > 0) {
-        economy_service_->add_balance(player_name, money);
-    } else if (money < 0) {
-        economy_service_->remove_balance(player_name, -money);
+    return apply_money_operation(id, player_name, money);
+}
+
+bool Territory::apply_money_operation(const std::string& id, const std::string& player_name, double money) const {
+    if (!economy_service_ || !std::isfinite(money)) {
+        getLogger().error("Economy intent {} pending: service unavailable or invalid amount", id);
+        return false;
     }
-    return true;
+    bool success = false;
+    try {
+        success = database_->applyMoney(id, [&] {
+            return money > 0 ? economy_service_->add_balance(player_name, money)
+                            : money < 0 ? economy_service_->remove_balance(player_name, -money) : true;
+        });
+    } catch (const std::exception& e) {
+        getLogger().error("Economy operation {} has uncertain outcome; reconcile manually: {}", id, e.what());
+        // Do not retry or compensate an unknown outcome.
+        throw std::runtime_error("经济操作结果未知，请联系管理员核对记录，勿重复操作");
+    }
+    if (!success) getLogger().error("Economy operation {} failed for {}: {}", id, player_name, money);
+    return success;
 }
 
 void Territory::entity_move_listener() const
@@ -220,7 +239,8 @@ void Territory::onLoad()
     //初始化各个类
     database_ = std::make_unique<DataBase>(db_file);
     action_ = std::make_unique<Territory_Action>(*database_, this, LangTty);
-    (void)database_->init_database();
+    if (database_->init_database() != SQLITE_OK)
+        throw std::runtime_error("Territory database initialization failed");
     // translate 构造函数已自动加载所有语言文件
 }
 
@@ -261,6 +281,11 @@ void Territory::onEnable()
     } catch (const std::exception& e) {
         getLogger().error(LangTty.getLocal("配置文件错误,使用默认配置")+","+e.what());
     }
+    // A shared allow-flight bool cannot identify grants from other plugins.
+    // Operators must explicitly opt into exclusive authority before we revoke.
+    config_fly_exclusive_authority = json_msg.contains("fly_exclusive_authority") && json_msg["fly_exclusive_authority"].is_boolean() && json_msg["fly_exclusive_authority"].get<bool>();
+    if (config_fly_on_tty && !config_fly_exclusive_authority)
+        getLogger().warning("Territory flight requires fly_exclusive_authority=true; keep disabled when another plugin manages flight");
     LangTty = translate(language_path, language);
     menu_ = std::make_unique<Menu>(*this, LangTty);
     event_listener_ = std::make_unique<EventListener>(this, LangTty);
@@ -277,8 +302,10 @@ void Territory::onEnable()
     registerEvent<endstone::ActorSpawnEvent>([this](auto& e) { event_listener_->onEnititySummon(e); });
     //快速创建领地选择监听
     registerEvent<endstone::PlayerInteractEvent>([this](auto& e){ event_listener_->quickCreateTtyRightClick(e); });
+    registerEvent<endstone::PlayerQuitEvent>([this](auto& e) { event_listener_->onPlayerQuit(e); });
     //玩家移动监听
-    registerEvent<endstone::PlayerMoveEvent>([this](auto& e) { event_listener_->onPlayerMove(e); });
+    registerEvent<endstone::PlayerMoveEvent>([this](auto& e) { event_listener_->onPlayerMove(e); }, endstone::EventPriority::Monitor, true);
+    registerEvent<endstone::PlayerTeleportEvent>([this](auto& e) { event_listener_->onPlayerMove(e); }, endstone::EventPriority::Monitor, true);
     //数据库读取
     (void)action_->get_all_tty();
     //周期执行
@@ -319,6 +346,7 @@ void Territory::onDisable()
 {
     getLogger().info("onDisable is called");
     getServer().getScheduler().cancelTasks(*this);
+    if (event_listener_) event_listener_->shutdown();
     Territory_Action::clearCache();
 }
 
@@ -361,7 +389,7 @@ bool Territory::onCommand(endstone::CommandSender &sender, const endstone::Comma
                         string dim = getServer().getPlayer(player_name)->getLocation().getDimension().getName();
                         
                         // 检查领地大小
-                        const int area = Territory_Action::get_tty_area(static_cast<int>(std::get<0>(pos1)),static_cast<int>(std::get<2>(pos1)),static_cast<int>(std::get<0>(pos2)),static_cast<int>(std::get<2>(pos2)));
+                        const auto area = Territory_Action::get_tty_area(std::get<0>(pos1),std::get<2>(pos1),std::get<0>(pos2),std::get<2>(pos2));
                         if (area >= config_max_tty_area && config_max_tty_area != -1) {
                             sender.sendErrorMessage(LangTty.getLocal("你的领地大小超过所能创建的最大面积,无法创建", localeP));
                             return false;
@@ -376,14 +404,20 @@ bool Territory::onCommand(endstone::CommandSender &sender, const endstone::Comma
                         if (config_money_connect) {
                             const double money = get_player_money(player_name);
                             if (const auto value = area * config_price; money >= value) {
-                                (void)change_player_money(player_name,-value);
+                                if (!change_player_money(player_name,-value)) {
+                                    sender.sendErrorMessage("扣费失败，未创建领地");
+                                    return false;
+                                }
                                 sender.sendMessage(LangTty.getLocal("设置领地已扣费:", localeP) + to_string(value));
                                 // 调用领地创建函数
                                 if (auto [success, message] = action_->create_territory(player_name, pos1, pos2, tppos, dim); success) {
                                     sender.sendMessage(LangTty.getLocal("成功添加领地", localeP));
                                 } else {
                                     sender.sendErrorMessage(LangTty.getLocal(message, localeP));
-                                    (void)change_player_money(player_name,value); // 创建失败返还资金
+                                    if (!change_player_money(player_name,value)) {
+                                        getLogger().error("Create compensation failed for {}: {}", player_name, value);
+                                        sender.sendErrorMessage("退款失败，请联系管理员核对经济记录");
+                                    } // 创建失败返还资金
                                 }
                             } else {
                                 sender.sendErrorMessage(LangTty.getLocal("你的资产不足以设置此大小的领地,设置此领地所需要的资金为:", localeP) +
@@ -424,7 +458,7 @@ bool Territory::onCommand(endstone::CommandSender &sender, const endstone::Comma
                         string dim = getServer().getPlayer(player_name)->getLocation().getDimension().getName();
                         
                         // 检查领地大小
-                        const int area = Territory_Action::get_tty_area(static_cast<int>(std::get<0>(pos1)),static_cast<int>(std::get<2>(pos1)),static_cast<int>(std::get<0>(pos2)),static_cast<int>(std::get<2>(pos2)));
+                        const auto area = Territory_Action::get_tty_area(std::get<0>(pos1),std::get<2>(pos1),std::get<0>(pos2),std::get<2>(pos2));
                         if (area >= config_max_tty_area && config_max_tty_area != -1) {
                             sender.sendErrorMessage(LangTty.getLocal("你的领地大小超过所能创建的最大面积,无法创建", localeP));
                             return false;
@@ -441,7 +475,10 @@ bool Territory::onCommand(endstone::CommandSender &sender, const endstone::Comma
                             const double money = get_player_money(player_name);
                             const auto value = area * config_price;
                             if (money >= value) {
-                                (void)change_player_money(player_name,-value);
+                                if (!change_player_money(player_name,-value)) {
+                                    sender.sendErrorMessage("扣费失败，未创建领地");
+                                    return false;
+                                }
                                 sender.sendMessage(LangTty.getLocal("设置领地已扣费:", localeP) + to_string(value));
                                 // 调用子领地创建函数
                                 if (auto [success, child_territory_name] = action_->create_sub_territory(player_name, pos1, pos2, tppos, dim); success) {
@@ -449,7 +486,10 @@ bool Territory::onCommand(endstone::CommandSender &sender, const endstone::Comma
 
                                 } else {
                                     sender.sendErrorMessage(LangTty.getLocal(child_territory_name, localeP)); // child_territory_name here contains error message
-                                    (void)change_player_money(player_name,value); // 创建失败返还资金
+                                    if (!change_player_money(player_name,value)) {
+                                        getLogger().error("Create compensation failed for {}: {}", player_name, value);
+                                        sender.sendErrorMessage("退款失败，请联系管理员核对经济记录");
+                                    } // 创建失败返还资金
                                 }
                             } else {
                                 sender.sendErrorMessage(LangTty.getLocal("你的资产不足以设置此大小的领地,设置此领地所需要的资金为:", localeP) +
@@ -680,9 +720,7 @@ bool Territory::onCommand(endstone::CommandSender &sender, const endstone::Comma
 
                                     player->teleport(loc);
                                     Menu::addRecentTp(player_name, tty_name);
-                                } else if (tty_info->member.find(player_name) != std::string::npos ||
-                                           tty_info->manager.find(player_name) != std::string::npos ||
-                                           player_name == tty_info->owner) {
+                                } else if (tty_info->cached_all_members.contains(player_name)) {
                                     auto player = getServer().getPlayer(player_name);
                                     auto tty_Dim = getServer().getLevel()->getDimension(tty_info->dim);
                                     endstone::Location loc(*tty_Dim, static_cast<float>(get<0>(tty_info->tppos)),
@@ -767,7 +805,7 @@ bool Territory::onCommand(endstone::CommandSender &sender, const endstone::Comma
                             }
 
                             // 检查领地大小
-                            const int area = Territory_Action::get_tty_area(static_cast<int>(std::get<0>(pos1)),static_cast<int>(std::get<2>(pos1)),static_cast<int>(std::get<0>(pos2)),static_cast<int>(std::get<2>(pos2)));
+                            const auto area = Territory_Action::get_tty_area(std::get<0>(pos1),std::get<2>(pos1),std::get<0>(pos2),std::get<2>(pos2));
                             if (area >= config_max_tty_area && config_max_tty_area != -1) {
                                 sender.sendErrorMessage(LangTty.getLocal("你的领地大小超过所能创建的最大面积,无法创建", localeP));
                                 return false;
@@ -776,30 +814,44 @@ bool Territory::onCommand(endstone::CommandSender &sender, const endstone::Comma
                             double changed_money = 0;
                             if (config_money_connect)
                             {
-                                const int old_area = Territory_Action::get_tty_area(static_cast<int>(get<0>(tty_data->pos1)),static_cast<int>(get<2>(tty_data->pos1)),static_cast<int>(get<0>(tty_data->pos2)),static_cast<int>(get<2>(tty_data->pos2)));
+                                const auto old_area = Territory_Action::get_tty_area(get<0>(tty_data->pos1),get<2>(tty_data->pos1),get<0>(tty_data->pos2),get<2>(tty_data->pos2));
                                 const auto old_value = old_area * config_price;
                                 const auto new_value = area * config_price;
                                 changed_money = new_value - old_value;
+                                if (!std::isfinite(changed_money)) {
+                                    sender.sendErrorMessage("经济金额超出有效范围，未调整领地");
+                                    return false;
+                                }
                                 if (get_player_money(sender.getName()) < changed_money)
                                 {
                                     sender.sendErrorMessage(LangTty.getLocal("你没有足够的资金", localeP));
                                     return false;
                                 }
-                                if (changed_money != 0)
+                                if (changed_money > 0)
                                 {
-                                    (void)change_player_money(sender.getName(), -changed_money);
+                                    if (!change_player_money(sender.getName(), -changed_money)) {
+                                        sender.sendErrorMessage("经济操作失败，未调整领地");
+                                        return false;
+                                    }
                                 }
                             }
 
                             if (auto [fst, snd] = action_->resize_territory(pos1,pos2,*tty_data,tppos, localeP); fst)
                             {
                                 sender.sendMessage(LangTty.getLocal(snd, localeP));
+                                if (changed_money < 0 && !change_player_money(sender.getName(), -changed_money)) {
+                                    getLogger().error("Resize refund failed for {}: {}", sender.getName(), -changed_money);
+                                    sender.sendErrorMessage("领地已调整，但退款失败，请联系管理员核对记录");
+                                }
                             }  else
                             {
                                 sender.sendErrorMessage(LangTty.getLocal(snd, localeP));
-                                if (changed_money!=0)
+                                if (changed_money > 0)
                                 {
-                                    (void)change_player_money(sender.getName(), changed_money);
+                                    if (!change_player_money(sender.getName(), changed_money)) {
+                                        getLogger().error("Resize compensation failed for {}: {}", sender.getName(), changed_money);
+                                        sender.sendErrorMessage("资金恢复失败，请联系管理员核对经济记录");
+                                    }
                                 }
                             }
 
@@ -868,23 +920,9 @@ bool Territory::onCommand(endstone::CommandSender &sender, const endstone::Comma
                     config_max_tty_area = json_msg["max_tty_area"];
                     config_welcome_all = json_msg["welcome_all"];
                     config_allow_op_as_member = json_msg["allow_op_as_member"];
-                    if (json_msg["allow_fly_on_territory"] == false || config_fly_on_tty == true)
-                    {
-                        for (const auto pEntity : getServer().getOnlinePlayers())
-                        {
-                            if (static_cast<int>(pEntity->getGameMode()) == 0 || static_cast<int>(pEntity->getGameMode()) == 3)
-                            {
-                                if (pEntity->getAllowFlight())
-                                {
-                                    pEntity->setAllowFlight(false);
-                                }
-                            }
-                        }
-                        config_fly_on_tty = false;
-                    } else
-                    {
-                        config_fly_on_tty = json_msg["allow_fly_on_territory"];
-                    }
+                    event_listener_->shutdown(); // Revoke only this session's own grants.
+                    config_fly_on_tty = json_msg["allow_fly_on_territory"];
+                    config_fly_exclusive_authority = json_msg.value("fly_exclusive_authority", false);
                     if (json_msg["money_connect"]) {
                         if (json_msg["price"] > 0) {
                             config_money_connect = true;

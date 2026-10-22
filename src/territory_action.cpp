@@ -12,6 +12,27 @@ Territory_Action::Territory_Action(DataBase& database, Territory* territory_, tr
       lang_tty_(lang_tty)
 {}
 
+Territory_Action::Snapshot Territory_Action::prepareSnapshot(ClaimMap claims) {
+    Snapshot snapshot{std::move(claims), {}};
+    for (auto& [name, tty] : snapshot.claims) {
+        if (!claim_geometry::indexable(tty.pos1, tty.pos2))
+            throw std::runtime_error("Territory exceeds spatial index budget: " + name);
+        const int minX = std::floor(std::min(get<0>(tty.pos1), get<0>(tty.pos2)) / 128);
+        const int maxX = std::floor(std::max(get<0>(tty.pos1), get<0>(tty.pos2)) / 128);
+        const int minZ = std::floor(std::min(get<2>(tty.pos1), get<2>(tty.pos2)) / 128);
+        const int maxZ = std::floor(std::max(get<2>(tty.pos1), get<2>(tty.pos2)) / 128);
+        for (int x = minX; x <= maxX; ++x)
+            for (int z = minZ; z <= maxZ; ++z)
+                snapshot.grid[GridKey{x, z}].push_back(&tty);
+    }
+    return snapshot;
+}
+
+void Territory_Action::publishSnapshot(Snapshot& snapshot) noexcept {
+    all_tty.swap(snapshot.claims);
+    spatial_grid.swap(snapshot.grid);
+}
+
 // 从外部获取all_tty数据
 const std::map<std::string, TerritoryData>&
 Territory_Action::getAllTty() {
@@ -21,26 +42,23 @@ Territory_Action::getAllTty() {
 //从数据库读取全部领地数据并载入全局变量all_tty
 std::map<std::string, TerritoryData>& Territory_Action::get_all_tty(std::string target_name) {
     bool is_incremental = !target_name.empty();
-    std::string sql = is_incremental
-        ? std::format("SELECT * FROM territories WHERE name = '{}';", target_name)
-        : "SELECT * FROM territories;";
-
     std::vector<std::map<std::string, std::string>> result;
-    database_.querySQL_many(sql, result);
+    if (database_.readTerritories(result, target_name) != SQLITE_OK)
+        throw std::runtime_error("Territory snapshot read failed; previous cache retained");
 
     // 定义内部解析逻辑
     auto parse_to_tty = [&](const std::map<std::string, std::string>& data) {
         TerritoryData tty;
         tty.name = data.at("name");
-        tty.pos1 = {static_cast<double>(DataBase::stringToInt(data.at("pos1_x"))),
-                    static_cast<double>(DataBase::stringToInt(data.at("pos1_y"))),
-                    static_cast<double>(DataBase::stringToInt(data.at("pos1_z")))};
-        tty.pos2 = {static_cast<double>(DataBase::stringToInt(data.at("pos2_x"))),
-                    static_cast<double>(DataBase::stringToInt(data.at("pos2_y"))),
-                    static_cast<double>(DataBase::stringToInt(data.at("pos2_z")))};
-        tty.tppos = {static_cast<double>(DataBase::stringToInt(data.at("tppos_x"))),
-                     static_cast<double>(DataBase::stringToInt(data.at("tppos_y"))),
-                     static_cast<double>(DataBase::stringToInt(data.at("tppos_z")))};
+        tty.pos1 = {std::stod(data.at("pos1_x")),
+                    std::stod(data.at("pos1_y")),
+                    std::stod(data.at("pos1_z"))};
+        tty.pos2 = {std::stod(data.at("pos2_x")),
+                    std::stod(data.at("pos2_y")),
+                    std::stod(data.at("pos2_z"))};
+        tty.tppos = {std::stod(data.at("tppos_x")),
+                     std::stod(data.at("tppos_y")),
+                     std::stod(data.at("tppos_z"))};
         tty.owner = data.at("owner");
         tty.manager = data.at("manager");
         tty.member = data.at("member");
@@ -54,60 +72,22 @@ std::map<std::string, TerritoryData>& Territory_Action::get_all_tty(std::string 
         tty.if_damage = DataBase::stringToInt(data.at("if_damage"));
         tty.if_edge_piston = DataBase::stringToInt(data.at("if_edge_piston"));
         tty.if_wither = DataBase::stringToInt(data.at("if_wither"));
+        tty.pos1 = claim_geometry::normalize(tty.pos1);
+        tty.pos2 = claim_geometry::normalize(tty.pos2);
+        if (!claim_geometry::indexable(tty.pos1, tty.pos2))
+            throw std::runtime_error("Stored territory exceeds spatial index budget: " + tty.name);
         tty.updateCache();
         return tty;
     };
 
-    // --- 增量更新 ---
-    if (is_incremental) {
-        if (all_tty.contains(target_name)) {
-            remove_tty_from_grid(target_name);
-        }
-
-        if (result.empty()) {
-            // 领地被删除
-            all_tty.erase(target_name);
-        } else {
-            // 新增或修改
-            all_tty[target_name] = parse_to_tty(result[0]);
-            add_tty_to_grid(&all_tty[target_name]);
-        }
-        return all_tty;
-    }
-
-    // --- 全量更新 ---
-    if (result.empty()) {
-        all_tty.clear();
-        spatial_grid.clear();
-        return all_tty;
-    }
-
-    std::map<std::string, TerritoryData> new_all_tty;
-    std::unordered_map<GridKey, std::vector<TerritoryData*>, GridKeyHash> new_spatial_grid;
-
+    ClaimMap next = is_incremental ? all_tty : ClaimMap{};
+    if (is_incremental) next.erase(target_name);
     for (const auto& row : result) {
-        TerritoryData tty = parse_to_tty(row);
-        new_all_tty[tty.name] = std::move(tty);
+        auto tty = parse_to_tty(row);
+        next[tty.name] = std::move(tty);
     }
-
-    // 重建全量索引
-    for (auto& territory : new_all_tty | std::views::values) {
-        int minX = std::floor(std::get<0>(territory.pos1) / GRID_SIZE);
-        int maxX = std::floor(std::get<0>(territory.pos2) / GRID_SIZE);
-        int minZ = std::floor(std::get<2>(territory.pos1) / GRID_SIZE);
-        int maxZ = std::floor(std::get<2>(territory.pos2) / GRID_SIZE);
-        if (minX > maxX) std::swap(minX, maxX);
-        if (minZ > maxZ) std::swap(minZ, maxZ);
-
-        for (int x = minX; x <= maxX; ++x) {
-            for (int z = minZ; z <= maxZ; ++z) {
-                new_spatial_grid[GridKey{x, z}].push_back(&territory);
-            }
-        }
-    }
-
-    all_tty.swap(new_all_tty);
-    spatial_grid.swap(new_spatial_grid);
+    auto snapshot = prepareSnapshot(std::move(next));
+    publishSnapshot(snapshot);
     return all_tty;
 }
 
@@ -318,28 +298,18 @@ int Territory_Action::check_tty_num(const std::string& player_name) {
 }
 
 //计算面积
-int Territory_Action::get_tty_area(const int x1,const int z1,const int x2,const int z2) {
-    // 计算矩形的宽度和高度
-    const int width = abs(x2 - x1);
-    const int height = abs(z2 - z1);
-
-    // 计算面积
-    const int area = width * height;
-
-    // 返回面积
-    return area;
+std::int64_t Territory_Action::get_tty_area(double x1, double z1, double x2, double z2) {
+    return claim_geometry::area(x1, z1, x2, z2);
 }
 
 // 用于将命令提取的pos转换成需要的值
 std::tuple<double, double, double> Territory_Action::pos_to_tuple(const std::string& str) {
-    std::tuple<double, double, double> result;
     std::stringstream ss(str);
-
-    // 使用流提取操作符来解析字符串中的浮点数
-    if (double value1, value2, value3; ss >> value1 >> value2 >> value3) {
-        result = std::make_tuple(value1, value2, value3);
-    }
-    return result;
+    double x, y, z;
+    std::string extra;
+    if (!(ss >> x >> y >> z) || (ss >> extra))
+        throw std::invalid_argument("坐标格式无效");
+    return claim_geometry::normalize({x, y, z});
 }
 
 //检查立方体是否为子集函数
@@ -360,8 +330,17 @@ bool Territory_Action::isSubsetCube(const Cube &cube1, const Cube &cube2) {
            cube1_min_z >= cube2_min_z && cube1_max_z <= cube2_max_z;
 }
 
-std::pair<bool, std::string> Territory_Action::create_territory(const std::string& player_name, const Point3D& pos1, const Point3D& pos2, const Point3D& tppos, const std::string& dim)
+std::pair<bool, std::string> Territory_Action::create_territory(const std::string& player_name, const Point3D& input1, const Point3D& input2, const Point3D& tppos, const std::string& dim)
 {
+    const auto pos1 = claim_geometry::normalize(input1);
+    const auto pos2 = claim_geometry::normalize(input2);
+    const auto area = get_tty_area(get<0>(pos1), get<2>(pos1), get<0>(pos2), get<2>(pos2));
+    if (get<1>(pos1) < -64 || get<1>(pos1) > 320 || get<1>(pos2) < -64 || get<1>(pos2) > 320)
+        return {false, "无法在世界之外设置领地"};
+    if (!claim_geometry::indexable(pos1, pos2) ||
+        (territory_->config_max_tty_area != -1 && area >= territory_->config_max_tty_area))
+        return {false, "领地范围超过面积或空间索引限制"};
+
     //检查领地是否为一个点
     if (pos1 == pos2) {
         return {false, "无法设置领地为一个点"};
@@ -399,24 +378,22 @@ std::pair<bool, std::string> Territory_Action::create_territory(const std::strin
     }
 #endif
 
-    // 插入新领地数据到数据库
-    if (const std::string name = ss.str(); database_.addTerritory(name,
-                                                                 std::get<0>(pos1), std::get<1>(pos1), std::get<2>(pos1),
-                                                                 std::get<0>(pos2), std::get<1>(pos2), std::get<2>(pos2),
-                                                                 std::get<0>(tppos), std::get<1>(tppos), std::get<2>(tppos),
-                                                                 player_name, "", "",  // owner, manager, member
-                                                                 dim, "",
-                                                                 0, 0, 0, 0, 0, 0, 0, 0
-    ) != SQLITE_OK) {
+    if (!insertClaim(ss.str(), player_name, pos1, pos2, tppos, dim, ""))
         return {false, "数据库操作失败"};
-        }
-
-    (void)get_all_tty(ss.str());
     return {true, "成功创建领地"};
 }
 
-std::pair<bool, std::string> Territory_Action::create_sub_territory(const std::string& player_name, const Point3D& pos1, const Point3D& pos2, const Point3D& tppos, const std::string& dim)
+std::pair<bool, std::string> Territory_Action::create_sub_territory(const std::string& player_name, const Point3D& input1, const Point3D& input2, const Point3D& tppos, const std::string& dim)
 {
+    const auto pos1 = claim_geometry::normalize(input1);
+    const auto pos2 = claim_geometry::normalize(input2);
+    const auto area = get_tty_area(get<0>(pos1), get<2>(pos1), get<0>(pos2), get<2>(pos2));
+    if (get<1>(pos1) < -64 || get<1>(pos1) > 320 || get<1>(pos2) < -64 || get<1>(pos2) > 320)
+        return {false, "无法在世界之外设置领地"};
+    if (!claim_geometry::indexable(pos1, pos2) ||
+        (territory_->config_max_tty_area != -1 && area >= territory_->config_max_tty_area))
+        return {false, "领地范围超过面积或空间索引限制"};
+
     //检查领地是否为一个点
     if (pos1 == pos2) {
         return {false, "无法设置领地为一个点"};
@@ -457,19 +434,33 @@ std::pair<bool, std::string> Territory_Action::create_sub_territory(const std::s
 
     std::string child_territory_name = parent_name + "_" + ss.str();
 
-    // 写入数据库
-    if (database_.addTerritory(child_territory_name,
-                              std::get<0>(pos1), std::get<1>(pos1), std::get<2>(pos1),
-                              std::get<0>(pos2), std::get<1>(pos2), std::get<2>(pos2),
-                              std::get<0>(tppos), std::get<1>(tppos), std::get<2>(tppos),
-                              player_name, "", "",
-                              dim, parent_name,
-                              0, 0, 0, 0, 0, 0, 0, 0
-        ) != SQLITE_OK) {
+    if (!insertClaim(child_territory_name, player_name, pos1, pos2, tppos, dim, parent_name))
         return {false, "数据库操作失败"};
-        }
-    (void)get_all_tty(child_territory_name);
     return {true, child_territory_name};
+}
+
+bool Territory_Action::insertClaim(const std::string& name, const std::string& owner,
+                                  const Point3D& pos1, const Point3D& pos2, const Point3D& tppos,
+                                  const std::string& dimension, const std::string& parent) {
+    if (all_tty.contains(name)) return false;
+    TerritoryData claim;
+    claim.name = name;
+    claim.owner = owner;
+    claim.pos1 = pos1;
+    claim.pos2 = pos2;
+    claim.tppos = tppos;
+    claim.dim = dimension;
+    claim.father_tty = parent;
+    claim.updateCache();
+    auto next = all_tty;
+    next.emplace(name, std::move(claim));
+    auto snapshot = prepareSnapshot(std::move(next));
+    if (database_.addTerritory(name, get<0>(pos1), get<1>(pos1), get<2>(pos1),
+                              get<0>(pos2), get<1>(pos2), get<2>(pos2),
+                              get<0>(tppos), get<1>(tppos), get<2>(tppos), owner, "", "",
+                              dimension, parent, 0,0,0,0,0,0,0,0) != SQLITE_OK) return false;
+    publishSnapshot(snapshot);
+    return true;
 }
 
 //列出符合条件父领地的函数
@@ -481,15 +472,13 @@ std::pair<bool, std::string> Territory_Action::listTrueFatherTTY(const std::stri
 
     for (const auto &val: all_tty | views::values) {
         const TerritoryData& ttyInfo = val;
-        std::string ttyOwner = ttyInfo.owner;
-        std::string ttyManager = ttyInfo.manager;
         Point3D pos1 = ttyInfo.pos1;
         Point3D pos2 = ttyInfo.pos2;
         std::string dim = ttyInfo.dim;
         std::string ttyName = ttyInfo.name;
 
         // 玩家为领地主或领地管理员
-        if (playerName == ttyOwner || ttyManager.find(playerName) != std::string::npos) {
+        if (ttyInfo.cached_operators.contains(playerName)) {
             // 领地维度相同
             if (childDim == dim) {
                 // 检查全包围领地
@@ -540,62 +529,52 @@ for (const auto &data: result) {
 
 
 // 删除领地函数
-bool Territory_Action::del_Tty_by_name(const std::string& territory_name){
-    const auto tty_data = read_territory_by_name(territory_name);
-    if (!tty_data) {
-        return false;
-    }
-
-    // 获取子领地并修改它们的父领地
-    for (const auto sub_ttys = getSubTty(territory_name); const auto &sub_tty: sub_ttys) {
-        (void)database_.updateValue("territories","father_tty","","name",sub_tty);
-    }
-    (void)database_.deleteTty(tty_data->name);
-
-    // 在所有数据库操作完成后，统一刷新全局领地缓存
-    all_tty = get_all_tty(territory_name);
-
+bool Territory_Action::del_Tty_by_name(const std::string& territory_name, const std::string& owner, double refund, std::string* operation){
+    auto next = all_tty;
+    if (!next.erase(territory_name)) return false;
+    for (auto& [name, tty] : next) if (tty.father_tty == territory_name) tty.father_tty.clear();
+    auto snapshot = prepareSnapshot(std::move(next));
+    if (!database_.deleteTerritory(territory_name, owner, refund, operation)) return false;
+    publishSnapshot(snapshot);
     return true;
 }
 
 // 删除玩家领地函数，删除名称为 tty_name 的领地，并更新相关数据
 bool Territory_Action::del_player_tty(const std::string &tty_name)
 {
-    const auto tty_data = read_territory_by_name(tty_name);
-    const int area = get_tty_area(static_cast<int>(get<0>(tty_data->pos1)),static_cast<int>(get<2>(tty_data->pos1)),static_cast<int>(get<0>(tty_data->pos2)),static_cast<int>(get<2>(tty_data->pos2)));
-    string owner;
+    const auto* tty = read_territory_by_name(tty_name);
+    if (!tty) return false;
+    const auto owner = tty->owner;
+    const auto refund = get_tty_area(get<0>(tty->pos1), get<2>(tty->pos1),
+                                     get<0>(tty->pos2), get<2>(tty->pos2)) * territory_->config_price;
+    if (territory_->config_money_connect && !std::isfinite(refund)) return false;
+    // Delete commits first. Never pay for a failed delete or compensate with a
+    // second positive credit. Missing claims cannot be refunded on retry.
+    std::string operation;
+    if (!del_Tty_by_name(tty_name, owner, refund, territory_->config_money_connect ? &operation : nullptr)) return false;
     if (territory_->config_money_connect) {
-        const auto refund = area * territory_->config_price;
-        (void)territory_->change_player_money(tty_data->owner, refund);
-        const auto& server_ = territory_->getServer();
-        if (const auto the_player = server_.getPlayer(tty_data->owner)) {
-            owner = the_player->getName();
-            the_player->sendMessage(lang_tty_.getLocal("您的领地已被删除,以当前价格返还资金:") + to_string(refund));
+        const bool paid = territory_->apply_money_operation(operation, owner, refund);
+        if (auto* player = territory_->getServer().getPlayer(owner)) {
+            if (paid) player->sendMessage(lang_tty_.getLocal("您的领地已被删除,以当前价格返还资金:") + to_string(refund));
+            else player->sendErrorMessage("领地已删除，但退款失败，请联系管理员核对经济记录");
         }
+        if (!paid) territory_->getLogger().error("Refund failed after deleting claim {} for {}: {}", tty_name, owner, refund);
     }
-    if (del_Tty_by_name(tty_name)) {
-        return true;
-    }
-    if (!owner.empty())
-    {
-        (void)territory_->change_player_money(owner, area * territory_->config_price);
-    }
-    return false;
+    return true;
 }
 
 //重命名领地
-bool Territory_Action::rename_Tty(const std::string &territory_name, const std::string &new_tty_name) const {
-    if (read_territory_by_name(new_tty_name)) {
-        return false;
-    }
-    (void)database_.updateValue("territories","name",new_tty_name,"name",territory_name);
-    const auto sub_ttys = getSubTty(territory_name);
-    if (sub_ttys.empty()) {
-        return true;
-    }
-    for (const auto &sub_tty: sub_ttys) {
-        (void)database_.updateValue("territories","father_tty",new_tty_name,"name",sub_tty);
-    }
+bool Territory_Action::rename_Tty(const std::string &territory_name, const std::string &new_tty_name) {
+    if (new_tty_name.empty() || !all_tty.contains(territory_name) || all_tty.contains(new_tty_name)) return false;
+    auto next = all_tty;
+    auto node = next.extract(territory_name);
+    node.key() = new_tty_name;
+    node.mapped().name = new_tty_name;
+    next.insert(std::move(node));
+    for (auto& [name, tty] : next) if (tty.father_tty == territory_name) tty.father_tty = new_tty_name;
+    auto snapshot = prepareSnapshot(std::move(next));
+    if (!database_.renameTerritory(territory_name, new_tty_name)) return false;
+    publishSnapshot(snapshot);
     return true;
 }
 
@@ -604,13 +583,6 @@ bool Territory_Action::rename_Tty(const std::string &territory_name, const std::
     if (rename_Tty(oldname, newname)) {
         std::string msg = lang_tty_.getLocal("已重命名领地: 从 ") + oldname + lang_tty_.getLocal(" 到 ") + newname;
 
-        // --- 增量同步开始 ---
-        // 第一步：清理旧名字。内部会发现数据库没这个名了，从而在内存中删除 oldname 并从网格移除指针
-        (void)get_all_tty(oldname);
-
-        // 第二步：加载新名字。内部会从数据库读出 newname 的数据并重新挂载到空间网格
-        (void)get_all_tty(newname);
-        // --- 增量同步结束 ---
 
         return {true, msg};
     }
@@ -1142,8 +1114,17 @@ std::vector<TerritoryData> Territory_Action::getPlayerTtyList(const std::string 
 }
 
 //更改领地大小
-std::pair<bool, std::string> Territory_Action::resize_territory(const Point3D& pos1, const Point3D& pos2, const TerritoryData& old_tty_data, const Point3D& tppos, const std::string& locale)
+std::pair<bool, std::string> Territory_Action::resize_territory(const Point3D& input1, const Point3D& input2, const TerritoryData& old_tty_data, const Point3D& tppos, const std::string& locale)
 {
+    const auto pos1 = claim_geometry::normalize(input1);
+    const auto pos2 = claim_geometry::normalize(input2);
+    const auto area = get_tty_area(get<0>(pos1), get<2>(pos1), get<0>(pos2), get<2>(pos2));
+    if (get<1>(pos1) < -64 || get<1>(pos1) > 320 || get<1>(pos2) < -64 || get<1>(pos2) > 320)
+        return {false, "无法在世界之外设置领地"};
+    if (!claim_geometry::indexable(pos1, pos2) ||
+        (territory_->config_max_tty_area != -1 && area >= territory_->config_max_tty_area))
+        return {false, "领地范围超过面积或空间索引限制"};
+
     //检查领地是否为一个点
     if (pos1 == pos2) {
         return {false, "无法设置领地为一个点"};
@@ -1153,30 +1134,48 @@ std::pair<bool, std::string> Territory_Action::resize_territory(const Point3D& p
     if (isTerritoryOverlapping(pos1, pos2, old_tty_data.dim, true, old_tty_data.name)) {
         return {false, "领地新范围存在领地冲突,检查是否与其它领地重叠或者超过父领地及小于子领地范围"};
     }
-    const auto updateCoord = [&](const char* column, const double value) -> bool {
-        return database_.updateValue("territories", column, std::to_string(value), "name", old_tty_data.name);
-    };
-
-    std::pair failed_info = {false, "更改领地大小失败"};
-
-    if (!updateCoord("pos1_x", std::get<0>(pos1))) return failed_info;
-    if (!updateCoord("pos1_y", std::get<1>(pos1))) return failed_info;
-    if (!updateCoord("pos1_z", std::get<2>(pos1))) return failed_info;
-    if (!updateCoord("pos2_x", std::get<0>(pos2))) return failed_info;
-    if (!updateCoord("pos2_y", std::get<1>(pos2))) return failed_info;
-    if (!updateCoord("pos2_z", std::get<2>(pos2))) return failed_info;
-
-    //检查领地传送点位置
-    if (!isPointInCube(old_tty_data.tppos, pos1, pos2)) {
-        auto new_tppos = pos1;
-        if (std::get<1>(new_tppos) > 319 | std::get<1>(new_tppos) < 0)
-        {
-            std::get<1>(new_tppos) = std::get<1>(tppos);
-        }
-        (void)change_tty_tppos(old_tty_data.name, new_tppos, old_tty_data.dim, locale);
+    auto new_tp = old_tty_data.tppos;
+    if (!isPointInCube(new_tp, pos1, pos2)) {
+        new_tp = pos1;
+        if (get<1>(new_tp) > 319 || get<1>(new_tp) < 0) get<1>(new_tp) = get<1>(tppos);
+        if (!isPointInCube(new_tp, pos1, pos2)) return {false, "传送点不在领地范围内"};
     }
-    (void)get_all_tty(old_tty_data.name);
+    const auto name = old_tty_data.name;
+    auto next = all_tty;
+    auto& updated = next.at(name);
+    updated.pos1 = pos1;
+    updated.pos2 = pos2;
+    updated.tppos = new_tp;
+    auto snapshot = prepareSnapshot(std::move(next));
+    if (!database_.resizeTerritory(name, {
+            get<0>(pos1), get<1>(pos1), get<2>(pos1), get<0>(pos2), get<1>(pos2), get<2>(pos2),
+            get<0>(new_tp), get<1>(new_tp), get<2>(new_tp)}))
+        return {false, "更改领地大小失败"};
+    publishSnapshot(snapshot);
     return {true,"领地大小更改成功"};
+}
+
+bool Territory_Action::canPistonAffect(const Point3D& base, const std::string& dimension) const {
+    // SDK 0.11.2 has no moved-block list. Cover 12 connected movable blocks
+    // plus their destination (including slime/honey side branches). This is a
+    // conservative guard: pistons within 13 blocks of a protected boundary can
+    // be denied even when their actual moved blocks would not cross it.
+    constexpr double radius = 13;
+    const Point3D lo{get<0>(base)-radius, get<1>(base)-radius, get<2>(base)-radius};
+    const Point3D hi{get<0>(base)+radius, get<1>(base)+radius, get<2>(base)+radius};
+    std::unordered_set<const TerritoryData*> checked;
+    for (int x = std::floor(get<0>(lo)/GRID_SIZE); x <= std::floor(get<0>(hi)/GRID_SIZE); ++x) {
+        for (int z = std::floor(get<2>(lo)/GRID_SIZE); z <= std::floor(get<2>(hi)/GRID_SIZE); ++z) {
+            auto cell = spatial_grid.find(GridKey{x,z});
+            if (cell == spatial_grid.end()) continue;
+            for (auto* claim : cell->second) {
+                if (!checked.insert(claim).second || claim->dim != dimension || claim->if_edge_piston) continue;
+                if (is_overlapping({lo, hi}, {claim->pos1, claim->pos2}) &&
+                    !isSubsetCube({lo, hi}, {claim->pos1, claim->pos2})) return false;
+            }
+        }
+    }
+    return true;
 }
 
 void Territory_Action::clearCache()
