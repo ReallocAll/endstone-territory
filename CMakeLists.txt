@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 
 project(territory CXX)
-set(BASE_VERSION "0.4.3")
+set(BASE_VERSION "0.4.4")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -140,6 +140,9 @@ configure_file(
 target_include_directories(${PROJECT_NAME} PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/generated" "${binarystream_SOURCE_DIR}/include")
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(territory_geometry_tests tests/geometry_compatibility.cpp)
+    target_include_directories(territory_geometry_tests PRIVATE include)
+    add_test(NAME territory_geometry_compatibility COMMAND territory_geometry_tests)
     # Compile the same production paths on both supported toolchains. No BDS
     # server or platform mocks are needed for store/index/policy contracts.
     add_executable(territory_contract_tests tests/contracts.cpp ${PLUGIN_SOURCES})

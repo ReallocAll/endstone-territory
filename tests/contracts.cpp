@@ -93,33 +93,64 @@ int main() {
     catch (const std::runtime_error& e) { CHECK(std::string(e.what()) == "unknown"); }
     CHECK(db.queueMoney("Alice",5,"must not repeat").empty());
 
-    // Inclusive block geometry, negative fractions, finite arithmetic and index work.
-    CHECK(claim_geometry::area(0,0,0,10) == 11);
-    CHECK(claim_geometry::area(-1.2,-1.2,0.2,0.2) == 9);
-    CHECK(claim_geometry::area(-30000000,-30000000,30000000,30000000) == 3600000120000001LL);
+    // Legacy area/truncation semantics, finite arithmetic and bounded index work.
+    CHECK(claim_geometry::area(0,0,0,10) == 0);
+    CHECK(claim_geometry::area(-1.2,-1.2,0.2,0.2) == 1);
+    CHECK(claim_geometry::area(-30000000,-30000000,30000000,30000000) == 3600000000000000LL);
     CHECK(!claim_geometry::indexable({0,0,0},{1000000,0,0}));
     CHECK(!claim_geometry::indexable({0,0,0},{65535,0,65535}));
     bool rejected = false;
     try { (void)claim_geometry::block(std::numeric_limits<double>::infinity()); } catch (...) { rejected = true; }
     CHECK(rejected);
-    CHECK(std::get<0>(Territory_Action::pos_to_tuple("-0.5 1 2")) == -1);
+    CHECK(std::get<0>(Territory_Action::pos_to_tuple("-0.5 1 2")) == -0.5);
     rejected = false;
     try { (void)Territory_Action::pos_to_tuple("1 2 nope"); } catch (...) { rejected = true; }
     CHECK(rejected);
 
-    // Piston guard remains indexed and dimension-aware, including outside entry.
+    // Preserve the old body-only, one-block edge policy; no 13-block halo.
     CHECK(action.del_Tty_by_name("child"));
     add(db,"protected", "",0,100);
     (void)action.get_all_tty();
-    CHECK(!action.canPistonAffect({-1,50,50},"Overworld"));
-    CHECK(action.getInstance("")->canPiston({-1,50,50},"Overworld") == false);
-    CHECK(!action.canPistonAffect({99,50,50},"Overworld"));
+    CHECK(action.canPistonAffect({-1,50,50},"Overworld"));
+    CHECK(!action.getInstance("")->canPiston({-1,50,50},"Overworld").has_value());
+    CHECK(!action.canPistonAffect({0,50,50},"Overworld"));
+    CHECK(!action.canPistonAffect({100,50,50},"Overworld"));
+    CHECK(action.canPistonAffect({1,50,50},"Overworld"));
+    CHECK(action.canPistonAffect({12,50,50},"Overworld"));
+    CHECK(action.canPistonAffect({99,50,50},"Overworld"));
     CHECK(action.canPistonAffect({50,50,50},"Overworld"));
-    CHECK(action.canPistonAffect({-20,50,50},"Overworld"));
-    CHECK(action.canPistonAffect({-1,50,50},"Nether"));
+    CHECK(action.canPistonAffect({0,50,50},"Nether"));
     CHECK(db.updateValue("territories","if_edge_piston","1","name","protected"));
     (void)action.get_all_tty("protected");
-    CHECK(action.canPistonAffect({-1,50,50},"Overworld"));
+    CHECK(action.canPistonAffect({0,50,50},"Overworld"));
+    CHECK(db.updateValue("territories","if_edge_piston","0","name","protected"));
+
+    // Existing low-height and narrow claims must not disable every piston.
+    CHECK(db.resizeTerritory("protected", {0,0,0,100,20,100,50,10,50}));
+    (void)action.get_all_tty("protected");
+    CHECK(action.canPistonAffect({50,10,50},"Overworld"));
+    CHECK(action.canPistonAffect({50,1,50},"Overworld"));
+    CHECK(!action.canPistonAffect({50,0,50},"Overworld"));
+    CHECK(action.canPistonAffect({50,-1,50},"Overworld"));
+    CHECK(db.resizeTerritory("protected", {0,0,0,20,100,100,10,50,50}));
+    (void)action.get_all_tty("protected");
+    CHECK(action.canPistonAffect({10,50,50},"Overworld"));
+    CHECK(!action.canPistonAffect({0,50,50},"Overworld"));
+    CHECK(db.resizeTerritory("protected", {0,0,0,100,100,100,50,50,50}));
+    (void)action.get_all_tty("protected");
+
+    // Child policy overrides parent even when both edges contain the body.
+    add(db,"z_child","protected",0,20);
+    CHECK(db.updateValue("territories","if_edge_piston","1","name","z_child"));
+    (void)action.get_all_tty();
+    CHECK(action.canPistonAffect({0,50,10},"Overworld"));
+    CHECK(!action.canPistonAffect({0,50,50},"Overworld"));
+    CHECK(db.updateValue("territories","if_edge_piston","0","name","z_child"));
+    CHECK(db.updateValue("territories","if_edge_piston","1","name","protected"));
+    (void)action.get_all_tty();
+    CHECK(!action.canPistonAffect({0,50,10},"Overworld"));
+    CHECK(action.canPistonAffect({10,50,10},"Overworld"));
+    CHECK(action.del_Tty_by_name("z_child"));
 
     // A failed read must not unpublish protection, and failed insertion must not
     // introduce a claim/index entry before durable storage accepts it.
@@ -134,7 +165,49 @@ int main() {
     CHECK(!action.list_in_tty({-5,1,-5},"Overworld"));
     CHECK(db.executeSQL("DROP TRIGGER fail_insert") == SQLITE_OK);
     CHECK(action.create_territory("new owner",{-10.5,0,-10.5},{-2.5,10,-2.5},{-5,1,-5},"Overworld").first);
-    CHECK(std::get<0>(action.list_in_tty({-11,1,-11},"Overworld")->front().source->pos1) == -11);
+    CHECK(!action.list_in_tty({-11,1,-11},"Overworld"));
+    CHECK(std::get<0>(action.list_in_tty({-10,1,-10},"Overworld")->front().source->pos1) == -10);
+
+    // Resize persistence formats to six decimals before a legacy reload.
+    // Published geometry must agree with SQLite even across integer boundaries.
+    add(db,"rounding", "",200,210);
+    CHECK(db.resizeTerritory("rounding", {-5,0,200,5,100,210,0,50,205}));
+    (void)action.get_all_tty();
+    const auto rounding_before = *Territory_Action::read_territory_by_name("rounding");
+    CHECK(action.resize_territory({-0.9999999,0,200},{0.9999999,100,210},
+                                  rounding_before,{0,50,205}).first);
+    const auto rounding_published = *Territory_Action::read_territory_by_name("rounding");
+    CHECK(std::get<0>(rounding_published.pos1) == -1);
+    CHECK(std::get<0>(rounding_published.pos2) == 1);
+    const auto rounding_rows = rows(db,"rounding");
+    CHECK(std::stod(rounding_rows.front().at("pos1_x")) == -1);
+    CHECK(std::stod(rounding_rows.front().at("pos2_x")) == 1);
+    (void)action.get_all_tty();
+    CHECK(Territory_Action::read_territory_by_name("rounding")->pos1 == rounding_published.pos1);
+    CHECK(Territory_Action::read_territory_by_name("rounding")->pos2 == rounding_published.pos2);
+    CHECK(rows(db,"rounding") == rounding_rows);
+
+    // Loading old REAL boundaries truncates only the cache, never stored data.
+    CHECK(db.updateValue("territories","pos1_x","-1.75","name","rounding"));
+    CHECK(db.updateValue("territories","pos2_x","1.75","name","rounding"));
+    const auto fractional_rows = rows(db,"rounding");
+    (void)action.get_all_tty();
+    CHECK(std::get<0>(Territory_Action::read_territory_by_name("rounding")->pos1) == -1);
+    CHECK(std::get<0>(Territory_Action::read_territory_by_name("rounding")->pos2) == 1);
+    CHECK(rows(db,"rounding") == fractional_rows);
+    CHECK(action.del_Tty_by_name("rounding"));
+
+    // Reversed corners across negative index cells retain the old edge policy.
+    add(db,"negative_reverse", "",-110,-130);
+    CHECK(db.updateValue("territories","pos2_y","20","name","negative_reverse"));
+    (void)action.get_all_tty();
+    CHECK(action.canPistonAffect({-120,10,-120},"Overworld"));
+    CHECK(action.canPistonAffect({-129,10,-120},"Overworld"));
+    CHECK(!action.canPistonAffect({-130,10,-120},"Overworld"));
+    CHECK(!action.canPistonAffect({-110,10,-120},"Overworld"));
+    CHECK(action.canPistonAffect({-131,10,-120},"Overworld"));
+    CHECK(action.canPistonAffect({-130,10,-120},"Nether"));
+    CHECK(action.del_Tty_by_name("negative_reverse"));
 
     FlightOwnership flight;
     CHECK(!flight.reconcile("external",true,true,true));

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.4] - 2026-10-23
+
+- Restore the pre-0.4.3 piston-body edge policy; remove the 13-block three-dimensional exclusion halo that disabled machines in low or narrow claims.
+- Preserve dimension isolation, child-claim priority and edge-piston permissions without guessing moved blocks.
+- Restore legacy coordinate truncation and non-inclusive area pricing while retaining checked wide arithmetic and transaction safety.
+- Keep stored claim data intact; no automatic recircling, coordinate migration or reversal of previous payments.
+- Add compatibility regressions for low-height claims, boundary pistons, child permissions and fractional coordinates.
+
 ## [0.4.3] - 2026-10-22
 
 - Bind claim-name SQL lookups and use exact operator/member identity.

@@ -74,6 +74,7 @@ std::map<std::string, TerritoryData>& Territory_Action::get_all_tty(std::string 
         tty.if_wither = DataBase::stringToInt(data.at("if_wither"));
         tty.pos1 = claim_geometry::normalize(tty.pos1);
         tty.pos2 = claim_geometry::normalize(tty.pos2);
+        tty.tppos = claim_geometry::normalize(tty.tppos);
         if (!claim_geometry::indexable(tty.pos1, tty.pos2))
             throw std::runtime_error("Stored territory exceeds spatial index budget: " + tty.name);
         tty.updateCache();
@@ -309,7 +310,7 @@ std::tuple<double, double, double> Territory_Action::pos_to_tuple(const std::str
     std::string extra;
     if (!(ss >> x >> y >> z) || (ss >> extra))
         throw std::invalid_argument("坐标格式无效");
-    return claim_geometry::normalize({x, y, z});
+    return claim_geometry::validate({x, y, z});
 }
 
 //检查立方体是否为子集函数
@@ -332,8 +333,8 @@ bool Territory_Action::isSubsetCube(const Cube &cube1, const Cube &cube2) {
 
 std::pair<bool, std::string> Territory_Action::create_territory(const std::string& player_name, const Point3D& input1, const Point3D& input2, const Point3D& tppos, const std::string& dim)
 {
-    const auto pos1 = claim_geometry::normalize(input1);
-    const auto pos2 = claim_geometry::normalize(input2);
+    const auto pos1 = claim_geometry::validate(input1);
+    const auto pos2 = claim_geometry::validate(input2);
     const auto area = get_tty_area(get<0>(pos1), get<2>(pos1), get<0>(pos2), get<2>(pos2));
     if (get<1>(pos1) < -64 || get<1>(pos1) > 320 || get<1>(pos2) < -64 || get<1>(pos2) > 320)
         return {false, "无法在世界之外设置领地"};
@@ -385,8 +386,8 @@ std::pair<bool, std::string> Territory_Action::create_territory(const std::strin
 
 std::pair<bool, std::string> Territory_Action::create_sub_territory(const std::string& player_name, const Point3D& input1, const Point3D& input2, const Point3D& tppos, const std::string& dim)
 {
-    const auto pos1 = claim_geometry::normalize(input1);
-    const auto pos2 = claim_geometry::normalize(input2);
+    const auto pos1 = claim_geometry::validate(input1);
+    const auto pos2 = claim_geometry::validate(input2);
     const auto area = get_tty_area(get<0>(pos1), get<2>(pos1), get<0>(pos2), get<2>(pos2));
     if (get<1>(pos1) < -64 || get<1>(pos1) > 320 || get<1>(pos2) < -64 || get<1>(pos2) > 320)
         return {false, "无法在世界之外设置领地"};
@@ -446,9 +447,10 @@ bool Territory_Action::insertClaim(const std::string& name, const std::string& o
     TerritoryData claim;
     claim.name = name;
     claim.owner = owner;
-    claim.pos1 = pos1;
-    claim.pos2 = pos2;
-    claim.tppos = tppos;
+    // Match the legacy post-insert database reload without changing stored coordinates.
+    claim.pos1 = claim_geometry::normalize(pos1);
+    claim.pos2 = claim_geometry::normalize(pos2);
+    claim.tppos = claim_geometry::normalize(tppos);
     claim.dim = dimension;
     claim.father_tty = parent;
     claim.updateCache();
@@ -1116,8 +1118,8 @@ std::vector<TerritoryData> Territory_Action::getPlayerTtyList(const std::string 
 //更改领地大小
 std::pair<bool, std::string> Territory_Action::resize_territory(const Point3D& input1, const Point3D& input2, const TerritoryData& old_tty_data, const Point3D& tppos, const std::string& locale)
 {
-    const auto pos1 = claim_geometry::normalize(input1);
-    const auto pos2 = claim_geometry::normalize(input2);
+    const auto pos1 = claim_geometry::validate(input1);
+    const auto pos2 = claim_geometry::validate(input2);
     const auto area = get_tty_area(get<0>(pos1), get<2>(pos1), get<0>(pos2), get<2>(pos2));
     if (get<1>(pos1) < -64 || get<1>(pos1) > 320 || get<1>(pos2) < -64 || get<1>(pos2) > 320)
         return {false, "无法在世界之外设置领地"};
@@ -1143,9 +1145,9 @@ std::pair<bool, std::string> Territory_Action::resize_territory(const Point3D& i
     const auto name = old_tty_data.name;
     auto next = all_tty;
     auto& updated = next.at(name);
-    updated.pos1 = pos1;
-    updated.pos2 = pos2;
-    updated.tppos = new_tp;
+    updated.pos1 = claim_geometry::normalizeUpdate(pos1);
+    updated.pos2 = claim_geometry::normalizeUpdate(pos2);
+    updated.tppos = claim_geometry::normalizeUpdate(new_tp);
     auto snapshot = prepareSnapshot(std::move(next));
     if (!database_.resizeTerritory(name, {
             get<0>(pos1), get<1>(pos1), get<2>(pos1), get<0>(pos2), get<1>(pos2), get<2>(pos2),
@@ -1156,26 +1158,22 @@ std::pair<bool, std::string> Territory_Action::resize_territory(const Point3D& i
 }
 
 bool Territory_Action::canPistonAffect(const Point3D& base, const std::string& dimension) const {
-    // SDK 0.11.2 has no moved-block list. Cover 12 connected movable blocks
-    // plus their destination (including slime/honey side branches). This is a
-    // conservative guard: pistons within 13 blocks of a protected boundary can
-    // be denied even when their actual moved blocks would not cross it.
-    constexpr double radius = 13;
-    const Point3D lo{get<0>(base)-radius, get<1>(base)-radius, get<2>(base)-radius};
-    const Point3D hi{get<0>(base)+radius, get<1>(base)+radius, get<2>(base)+radius};
-    std::unordered_set<const TerritoryData*> checked;
-    for (int x = std::floor(get<0>(lo)/GRID_SIZE); x <= std::floor(get<0>(hi)/GRID_SIZE); ++x) {
-        for (int z = std::floor(get<2>(lo)/GRID_SIZE); z <= std::floor(get<2>(hi)/GRID_SIZE); ++z) {
-            auto cell = spatial_grid.find(GridKey{x,z});
-            if (cell == spatial_grid.end()) continue;
-            for (auto* claim : cell->second) {
-                if (!checked.insert(claim).second || claim->dim != dimension || claim->if_edge_piston) continue;
-                if (is_overlapping({lo, hi}, {claim->pos1, claim->pos2}) &&
-                    !isSubsetCube({lo, hi}, {claim->pos1, claim->pos2})) return false;
-            }
-        }
+    // Preserve the pre-0.4.3 policy: only the piston body inside a claim's
+    // existing one-block edge is restricted. Do not guess its moved blocks.
+    const GridKey key{static_cast<int>(std::floor(get<0>(base) / GRID_SIZE)),
+                      static_cast<int>(std::floor(get<2>(base) / GRID_SIZE))};
+    const auto cell = spatial_grid.find(key);
+    if (cell == spatial_grid.end()) return true;
+
+    bool parent_denied = false;
+    for (const auto* claim : cell->second) {
+        if (claim->dim != dimension || !isPointInCube(base, claim->pos1, claim->pos2)) continue;
+        const bool allowed = claim->if_edge_piston || !isPointInCubeEdge(base, claim->pos1, claim->pos2);
+        // Match list_in_tty: the first containing child overrides parent rules.
+        if (!claim->father_tty.empty()) return allowed;
+        if (!allowed) parent_denied = true;
     }
-    return true;
+    return !parent_denied;
 }
 
 void Territory_Action::clearCache()
